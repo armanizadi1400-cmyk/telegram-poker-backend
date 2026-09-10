@@ -31,7 +31,6 @@ game = {
 class Player:
 
     def __init__(self, user_id, name):
-
         self.user_id = user_id
         self.name = name
         self.chips = STARTING_CHIPS
@@ -41,7 +40,6 @@ class Player:
 
 
 class Action(BaseModel):
-
     user_id: str
     action: str
 
@@ -220,44 +218,76 @@ def next_card():
             "message": "Game has not started"
         }
 
-
-    current =
-        len(game["community_cards"])
+    current = len(game["community_cards"])
 
 
+    # ==============================
     # FLOP
-    # سه کارت با هم
+    # سه کارت همزمان
+    # ==============================
 
     if current == 0:
 
-        cards = [
+        flop = [
             game["deck"].pop(),
             game["deck"].pop(),
             game["deck"].pop()
         ]
 
-        game["community_cards"].extend(cards)
+        game["community_cards"].extend(flop)
+
+        return {
+            "success": True,
+            "stage": "flop",
+            "new_cards": flop,
+            "community_cards": game["community_cards"],
+            "pot": game["pot"]
+        }
 
 
+    # ==============================
     # TURN
     # یک کارت
+    # ==============================
 
     elif current == 3:
 
-        card = game["deck"].pop()
+        turn = game["deck"].pop()
 
-        game["community_cards"].append(card)
+        game["community_cards"].append(turn)
+
+        return {
+            "success": True,
+            "stage": "turn",
+            "new_cards": [turn],
+            "community_cards": game["community_cards"],
+            "pot": game["pot"]
+        }
 
 
+    # ==============================
     # RIVER
     # یک کارت
+    # ==============================
 
     elif current == 4:
 
-        card = game["deck"].pop()
+        river = game["deck"].pop()
 
-        game["community_cards"].append(card)
+        game["community_cards"].append(river)
 
+        return {
+            "success": True,
+            "stage": "river",
+            "new_cards": [river],
+            "community_cards": game["community_cards"],
+            "pot": game["pot"]
+        }
+
+
+    # ==============================
+    # پایان بازی
+    # ==============================
 
     else:
 
@@ -265,13 +295,6 @@ def next_card():
             "success": False,
             "message": "All community cards dealt"
         }
-
-
-    return {
-        "success": True,
-        "community_cards":
-            game["community_cards"]
-    }
 
 
 @app.post("/reset")
