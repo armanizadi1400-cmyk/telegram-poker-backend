@@ -18,15 +18,14 @@ SUITS = ["♠", "♥", "♦", "♣"]
 
 STARTING_CHIPS = 1000
 
+players = {}
 
-def create_deck():
-    deck = [
-        rank + suit
-        for suit in SUITS
-        for rank in RANKS
-    ]
-    random.shuffle(deck)
-    return deck
+game = {
+    "started": False,
+    "deck": [],
+    "community_cards": [],
+    "pot": 0
+}
 
 
 class Player:
@@ -39,12 +38,21 @@ class Player:
         self.bet = 0
 
 
-players = {}
-
-
 class Action(BaseModel):
     user_id: str
     action: str
+
+
+def create_deck():
+    deck = [
+        rank + suit
+        for suit in SUITS
+        for rank in RANKS
+    ]
+
+    random.shuffle(deck)
+
+    return deck
 
 
 @app.get("/")
@@ -57,13 +65,19 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
 
 @app.post("/join")
-def join_game(user_id: str, name: str = "Player"):
+def join_game(
+    user_id: str,
+    name: str = "Player"
+):
 
     if user_id not in players:
+
         players[user_id] = Player(
             user_id=user_id,
             name=name
@@ -87,10 +101,72 @@ def get_players():
             {
                 "user_id": p.user_id,
                 "name": p.name,
-                "chips": p.chips
+                "chips": p.chips,
+                "cards": p.cards
             }
             for p in players.values()
         ]
+    }
+
+
+@app.post("/start")
+def start_game():
+
+    if len(players) < 1:
+
+        return {
+            "success": False,
+            "message": "No players"
+        }
+
+    game["deck"] = create_deck()
+
+    game["community_cards"] = []
+
+    game["pot"] = 0
+
+    game["started"] = True
+
+    for player in players.values():
+
+        player.cards = [
+            game["deck"].pop(),
+            game["deck"].pop()
+        ]
+
+        player.folded = False
+
+        player.bet = 0
+
+    return {
+        "success": True,
+        "message": "Game started"
+    }
+
+
+@app.get("/game")
+def get_game():
+
+    return {
+        "started": game["started"],
+        "community_cards": game["community_cards"],
+        "pot": game["pot"]
+    }
+
+
+@app.get("/my-cards")
+def my_cards(user_id: str):
+
+    if user_id not in players:
+
+        return {
+            "success": False,
+            "cards": []
+        }
+
+    return {
+        "success": True,
+        "cards": players[user_id].cards
     }
 
 
@@ -106,12 +182,14 @@ def poker_action(data: Action):
     ]
 
     if data.action not in allowed:
+
         return {
             "success": False,
             "message": "Invalid action"
         }
 
     if data.user_id not in players:
+
         players[data.user_id] = Player(
             user_id=data.user_id,
             name="Player"
@@ -127,9 +205,54 @@ def poker_action(data: Action):
     }
 
 
-@app.get("/new-deck")
-def new_deck():
+@app.post("/next-card")
+def next_card():
+
+    if not game["started"]:
+
+        return {
+            "success": False,
+            "message": "Game has not started"
+        }
+
+    if len(game["community_cards"]) >= 5:
+
+        return {
+            "success": False,
+            "message": "All community cards dealt"
+        }
+
+    card = game["deck"].pop()
+
+    game["community_cards"].append(card)
 
     return {
-        "cards": create_deck()
+        "success": True,
+        "card": card,
+        "community_cards": game["community_cards"]
+    }
+
+
+@app.post("/reset")
+def reset_game():
+
+    game["started"] = False
+
+    game["deck"] = []
+
+    game["community_cards"] = []
+
+    game["pot"] = 0
+
+    for player in players.values():
+
+        player.cards = []
+
+        player.folded = False
+
+        player.bet = 0
+
+    return {
+        "success": True,
+        "message": "Game reset"
     }
