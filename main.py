@@ -15,7 +15,6 @@ app.add_middleware(
 
 RANKS = "23456789TJQKA"
 SUITS = ["♠", "♥", "♦", "♣"]
-
 STARTING_CHIPS = 1000
 
 players = {}
@@ -24,12 +23,11 @@ game = {
     "started": False,
     "deck": [],
     "community_cards": [],
-    "pot": 0
+    "pot": 0,
 }
 
 
 class Player:
-
     def __init__(self, user_id, name):
         self.user_id = user_id
         self.name = name
@@ -45,7 +43,6 @@ class Action(BaseModel):
 
 
 def create_deck():
-
     deck = [
         rank + suit
         for suit in SUITS
@@ -53,13 +50,11 @@ def create_deck():
     ]
 
     random.shuffle(deck)
-
     return deck
 
 
 @app.get("/")
 def home():
-
     return {
         "status": "online",
         "message": "Poker backend is running"
@@ -68,24 +63,14 @@ def home():
 
 @app.get("/health")
 def health():
-
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 
 @app.post("/join")
-def join_game(
-    user_id: str,
-    name: str = "Player"
-):
+def join_game(user_id: str, name: str = "Player"):
 
     if user_id not in players:
-
-        players[user_id] = Player(
-            user_id,
-            name
-        )
+        players[user_id] = Player(user_id, name)
 
     player = players[user_id]
 
@@ -105,8 +90,7 @@ def get_players():
             {
                 "user_id": p.user_id,
                 "name": p.name,
-                "chips": p.chips,
-                "cards": p.cards
+                "chips": p.chips
             }
             for p in players.values()
         ]
@@ -117,18 +101,14 @@ def get_players():
 def start_game():
 
     if len(players) < 1:
-
         return {
             "success": False,
             "message": "No players"
         }
 
     game["deck"] = create_deck()
-
     game["community_cards"] = []
-
     game["pot"] = 0
-
     game["started"] = True
 
     for player in players.values():
@@ -161,7 +141,6 @@ def get_game():
 def my_cards(user_id: str):
 
     if user_id not in players:
-
         return {
             "success": False,
             "cards": []
@@ -185,14 +164,12 @@ def poker_action(data: Action):
     ]
 
     if data.action not in allowed:
-
         return {
             "success": False,
             "message": "Invalid action"
         }
 
     if data.user_id not in players:
-
         players[data.user_id] = Player(
             data.user_id,
             "Player"
@@ -212,7 +189,6 @@ def poker_action(data: Action):
 def next_card():
 
     if not game["started"]:
-
         return {
             "success": False,
             "message": "Game has not started"
@@ -220,12 +196,7 @@ def next_card():
 
     current = len(game["community_cards"])
 
-
-    # ==============================
-    # FLOP
-    # سه کارت همزمان
-    # ==============================
-
+    # FLOP — 3 کارت همزمان
     if current == 0:
 
         flop = [
@@ -244,12 +215,7 @@ def next_card():
             "pot": game["pot"]
         }
 
-
-    # ==============================
-    # TURN
-    # یک کارت
-    # ==============================
-
+    # TURN — یک کارت
     elif current == 3:
 
         turn = game["deck"].pop()
@@ -264,12 +230,7 @@ def next_card():
             "pot": game["pot"]
         }
 
-
-    # ==============================
-    # RIVER
-    # یک کارت
-    # ==============================
-
+    # RIVER — یک کارت
     elif current == 4:
 
         river = game["deck"].pop()
@@ -284,36 +245,23 @@ def next_card():
             "pot": game["pot"]
         }
 
-
-    # ==============================
-    # پایان بازی
-    # ==============================
-
-    else:
-
-        return {
-            "success": False,
-            "message": "All community cards dealt"
-        }
+    return {
+        "success": False,
+        "message": "All community cards dealt"
+    }
 
 
 @app.post("/reset")
 def reset_game():
 
     game["started"] = False
-
     game["deck"] = []
-
     game["community_cards"] = []
-
     game["pot"] = 0
 
     for player in players.values():
-
         player.cards = []
-
         player.folded = False
-
         player.bet = 0
 
     return {
