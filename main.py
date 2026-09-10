@@ -29,7 +29,9 @@ game = {
 
 
 class Player:
+
     def __init__(self, user_id, name):
+
         self.user_id = user_id
         self.name = name
         self.chips = STARTING_CHIPS
@@ -39,11 +41,13 @@ class Player:
 
 
 class Action(BaseModel):
+
     user_id: str
     action: str
 
 
 def create_deck():
+
     deck = [
         rank + suit
         for suit in SUITS
@@ -57,6 +61,7 @@ def create_deck():
 
 @app.get("/")
 def home():
+
     return {
         "status": "online",
         "message": "Poker backend is running"
@@ -65,6 +70,7 @@ def home():
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok"
     }
@@ -79,8 +85,8 @@ def join_game(
     if user_id not in players:
 
         players[user_id] = Player(
-            user_id=user_id,
-            name=name
+            user_id,
+            name
         )
 
     player = players[user_id]
@@ -135,7 +141,6 @@ def start_game():
         ]
 
         player.folded = False
-
         player.bet = 0
 
     return {
@@ -191,8 +196,8 @@ def poker_action(data: Action):
     if data.user_id not in players:
 
         players[data.user_id] = Player(
-            user_id=data.user_id,
-            name="Player"
+            data.user_id,
+            "Player"
         )
 
     player = players[data.user_id]
@@ -215,21 +220,57 @@ def next_card():
             "message": "Game has not started"
         }
 
-    if len(game["community_cards"]) >= 5:
+
+    current =
+        len(game["community_cards"])
+
+
+    # FLOP
+    # سه کارت با هم
+
+    if current == 0:
+
+        cards = [
+            game["deck"].pop(),
+            game["deck"].pop(),
+            game["deck"].pop()
+        ]
+
+        game["community_cards"].extend(cards)
+
+
+    # TURN
+    # یک کارت
+
+    elif current == 3:
+
+        card = game["deck"].pop()
+
+        game["community_cards"].append(card)
+
+
+    # RIVER
+    # یک کارت
+
+    elif current == 4:
+
+        card = game["deck"].pop()
+
+        game["community_cards"].append(card)
+
+
+    else:
 
         return {
             "success": False,
             "message": "All community cards dealt"
         }
 
-    card = game["deck"].pop()
-
-    game["community_cards"].append(card)
 
     return {
         "success": True,
-        "card": card,
-        "community_cards": game["community_cards"]
+        "community_cards":
+            game["community_cards"]
     }
 
 
