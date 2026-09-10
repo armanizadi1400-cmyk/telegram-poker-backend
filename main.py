@@ -1,271 +1,319 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import random
 from collections import Counter
-from itertools import combinations
-from typing import Optional
 
-app = FastAPI(title="Telegram Poker Backend")
+app = FastAPI(title="Telegram Poker Backend", version="2.0")
+
+
+# =========================================================
+# CORS
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-RANKS = "23456789TJQKA"
-SUITS = ["♠", "♥", "♦", "♣"]
+
+# =========================================================
+# MODELS
+# =========================================================
+
+class JoinRequest(BaseModel):
+    user_id: str
+    name: str = "Player"
+
+
+class ActionRequest(BaseModel):
+    user_id: str
+    action: str
+    amount: Optional[int] = None
+
+
+# =========================================================
+# GAME STATE
+# =========================================================
 
 STARTING_CHIPS = 1000
+MAX_PLAYERS = 6
 SMALL_BLIND = 10
 BIG_BLIND = 20
 
-players = {}
-
-
-class Player:
-    def __init__(self, user_id, name):
-        self.user_id = str(user_id)
-        self.name = name
-        self.chips = STARTING_CHIPS
-        self.cards = []
-        self.folded = False
-        self.all_in = False
-        self.bet = 0
-        self.total_bet = 0
-
-
-class Action(BaseModel):
-    user_id: str
-    action: str
-    amount: int = 0
-
-
+players = []
 game = {
     "started": False,
-    "deck": [],
-    "community_cards": [],
-    "pot": 0,
     "stage": "waiting",
+    "pot": 0,
+    "community_cards": [],
+    "deck": [],
     "current_player": None,
-    "current_bet": 0,
-    "dealer_index": 0,
-    "acted_players": set(),
+    "current_bet": BIG_BLIND,
     "winner": None,
-    "message": "",
+    "message": "Waiting for game"
 }
 
 
+# =========================================================
+# DECK
+# =========================================================
+
+SUITS = ["♠", "♥", "♦", "♣"]
+RANKS = [
+    "2", "3", "4", "5", "6", "7", "8", "9",
+    "10", "J", "Q", "K", "A"
+]
+
+
 def create_deck():
-    deck = []
-
-    for suit in SUITS:
-        for rank in RANKS:
-            deck.append(rank + suit)
-
-    random.shuffle(deck)
-
-    return deck
-
-
-def active_players():
     return [
-        p for p in players.values()
-        if not p.folded and len(p.cards) == 2
+        rank + suit
+        for suit in SUITS
+        for rank in RANKS
     ]
 
 
-def players_can_act():
-    return [
-        p for p in active_players()
-        if not p.all_in and p.chips > 0
-    ]
+def reset_deck():
+    game["deck"] = create_deck()
+    random.shuffle(game["deck"])
 
 
-def public_players():
-    result = []
-
-    for p in players.values():
-        result.append({
-            "user_id": p.user_id,
-            "name": p.name,
-            "chips": p.chips,
-            "folded": p.folded,
-            "all_in": p.all_in,
-            "bet": p.bet,
-            "total_bet": p.total_bet,
-            "is_turn": p.user_id == game["current_player"],
-        })
-
-    return result
-
-
-def next_active_player(current_id: Optional[str] = None):
-    ids = list(players.keys())
-
-    if not ids:
+def deal_card():
+    if not game["deck"]:
         return None
 
-    if current_id in ids:
-        start = ids.index(current_id) + 1
-    else:
-        start = 0
+    return game["deck"].pop()
 
-    for i in range(len(ids)):
-        index = (start + i) % len(ids)
 
-        player = players[ids[index]]
+# =========================================================
+# HELPERS
+# =========================================================
 
-        if (
-            not player.folded
-            and not player.all_in
-            and player.chips > 0
-            and len(player.cards) == 2
-        ):
-            return player.user_id
+def find_player(user_id):
+    user_id = str(user_id)
+
+    for player in players:
+        if str(player["user_id"]) == user_id:
+            return player
 
     return None
 
 
-def reset_player_for_hand(player):
-    player.cards = []
-    player.folded = False
-    player.all_in = False
-    player.bet = 0
-    player.total_bet = 0
+def active_players():
+    return [
+        p for p in players
+        if not p.get("folded", False)
+    ]
 
 
-def prepare_new_betting_round():
-    for player in players.values():
-        player.bet = 0
+def serialize_player(player):
+    return {
+        "user_id": str(player["user_id"]),
+        "name": player.get("name", "Player"),
+        "chips": int(player.get("chips", 0)),
+        "bet": int(player.get("bet", 0)),
+        "folded": bool(player.get("folded", False)),
+        "all_in": bool(player.get("all_in", False))
+    }
 
-    game["current_bet"] = 0
-    game["acted_players"] = set()
-    game["current_player"] = next_active_player()
+
+def public_game():
+    return {
+        "started": game["started"],
+        "stage": game["stage"],
+        "pot": game["pot"],
+        "community_cards": list(game["community_cards"]),
+        "current_player": game["current_player"],
+        "current_bet": game["current_bet"],
+        "winner": game["winner"],
+        "message": game["message"]
+    }
+
+
+def update_message():
+    if not game["started"]:
+        game["message"] = "Waiting for game"
+        return
+
+    if game["current_player"]:
+        p = find_player(game["current_player"])
+
+        if p:
+            game["message"] = (
+                f"It's {p['name']}'s turn"
+            )
+
+
+def next_active_player(current_id=None):
+    active = [
+        p for p in players
+        if not p.get("folded", False)
+        and not p.get("all_in", False)
+        and p.get("chips", 0) > 0
+    ]
+
+    if not active:
+        return None
+
+    if current_id is None:
+        return str(active[0]["user_id"])
+
+    ids = [str(p["user_id"]) for p in active]
+
+    if str(current_id) not in ids:
+        return str(active[0]["user_id"])
+
+    index = ids.index(str(current_id))
+
+    for i in range(1, len(active) + 1):
+        candidate = active[(index + i) % len(active)]
+
+        if (
+            not candidate.get("folded", False)
+            and not candidate.get("all_in", False)
+            and candidate.get("chips", 0) > 0
+        ):
+            return str(candidate["user_id"])
+
+    return None
 
 
 def collect_bets():
-    for player in players.values():
-        if player.bet > 0:
-            game["pot"] += player.bet
-            player.bet = 0
+    total = 0
+
+    for player in players:
+        total += int(player.get("bet", 0))
+
+    game["pot"] = total
 
 
-def betting_round_finished():
-    active = active_players()
-
-    if len(active) <= 1:
-        return True
-
-    can_act = players_can_act()
-
-    if not can_act:
-        return True
-
-    for player in can_act:
-        if player.user_id not in game["acted_players"]:
-            return False
-
-        if player.bet != game["current_bet"]:
-            return False
-
-    return True
+def reset_player_round_data():
+    for player in players:
+        player["bet"] = 0
+        player["folded"] = False
+        player["all_in"] = False
+        player["cards"] = []
 
 
-def deal_flop():
-    cards = [
-        game["deck"].pop(),
-        game["deck"].pop(),
-        game["deck"].pop(),
-    ]
+# =========================================================
+# HAND EVALUATION
+# =========================================================
 
-    game["community_cards"].extend(cards)
-    game["stage"] = "flop"
-
-    return cards
-
-
-def deal_turn():
-    card = game["deck"].pop()
-
-    game["community_cards"].append(card)
-    game["stage"] = "turn"
-
-    return [card]
+HAND_NAMES = {
+    8: "Straight Flush",
+    7: "Four of a Kind",
+    6: "Full House",
+    5: "Flush",
+    4: "Straight",
+    3: "Three of a Kind",
+    2: "Two Pair",
+    1: "One Pair",
+    0: "High Card"
+}
 
 
-def deal_river():
-    card = game["deck"].pop()
+def card_value(card):
+    rank = card[:-1]
 
-    game["community_cards"].append(card)
-    game["stage"] = "river"
+    values = {
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "5": 5,
+        "6": 6,
+        "7": 7,
+        "8": 8,
+        "9": 9,
+        "10": 10,
+        "J": 11,
+        "Q": 12,
+        "K": 13,
+        "A": 14
+    }
 
-    return [card]
+    return values.get(rank, 0)
 
 
-def rank_value(rank):
-    return RANKS.index(rank) + 2
+def evaluate_hand(cards):
+    if len(cards) < 5:
+        return (0, 0)
 
+    values = sorted(
+        [card_value(c) for c in cards],
+        reverse=True
+    )
 
-def parse_card(card):
-    return card[0], card[1]
+    counts = Counter(values)
 
+    unique_values = sorted(
+        set(values),
+        reverse=True
+    )
 
-def evaluate_five(cards):
-    ranks = []
-    suits = []
-
-    for card in cards:
-        rank, suit = parse_card(card)
-
-        ranks.append(rank_value(rank))
-        suits.append(suit)
-
-    counts = Counter(ranks)
-
-    unique = sorted(set(ranks), reverse=True)
-
-    if 14 in unique:
-        unique.append(1)
-
+    # Straight
     straight_high = None
 
-    for i in range(len(unique) - 4):
-        group = unique[i:i + 5]
+    if 14 in unique_values:
+        unique_values.append(1)
 
-        if group[0] - group[4] == 4:
-            straight_high = group[0]
+    for i in range(len(unique_values) - 4):
+        seq = unique_values[i:i + 5]
+
+        if seq[0] - seq[4] == 4:
+            straight_high = seq[0]
             break
 
-    flush = len(set(suits)) == 1
+    suits = [c[-1] for c in cards]
 
-    if flush and straight_high:
-        return (8, straight_high)
+    flush_suit = None
 
-    four_cards = [
-        rank
-        for rank, count in counts.items()
-        if count == 4
-    ]
+    for suit in SUITS:
+        suited = [
+            card_value(c)
+            for c in cards
+            if c[-1] == suit
+        ]
 
-    if four_cards:
-        four = max(four_cards)
+        if len(suited) >= 5:
+            flush_suit = suit
+            break
 
-        kicker = max(
-            rank
-            for rank in ranks
-            if rank != four
+    # Straight flush
+    if flush_suit:
+        suited_values = sorted(
+            {
+                card_value(c)
+                for c in cards
+                if c[-1] == flush_suit
+            },
+            reverse=True
         )
 
-        return (7, four, kicker)
+        if 14 in suited_values:
+            suited_values.append(1)
 
-    triples = sorted(
+        for i in range(len(suited_values) - 4):
+            seq = suited_values[i:i + 5]
+
+            if seq[0] - seq[4] == 4:
+                return (8, seq[0])
+
+    four = [
+        v for v, count in counts.items()
+        if count >= 4
+    ]
+
+    if four:
+        return (7, max(four))
+
+    trips = sorted(
         [
-            rank
-            for rank, count in counts.items()
+            v for v, count in counts.items()
             if count >= 3
         ],
         reverse=True
@@ -273,256 +321,134 @@ def evaluate_five(cards):
 
     pairs = sorted(
         [
-            rank
-            for rank, count in counts.items()
+            v for v, count in counts.items()
             if count >= 2
         ],
         reverse=True
     )
 
-    if triples:
-        triple = triples[0]
-
-        other_pairs = [
-            rank
-            for rank in pairs
-            if rank != triple
+    if trips:
+        remaining_pairs = [
+            v for v in pairs
+            if v != trips[0]
         ]
 
-        if other_pairs:
-            return (6, triple, other_pairs[0])
+        if remaining_pairs:
+            return (
+                6,
+                trips[0] * 100 + remaining_pairs[0]
+            )
 
-    if flush:
+    if flush_suit:
         return (
             5,
-            *sorted(ranks, reverse=True)
+            max(
+                card_value(c)
+                for c in cards
+                if c[-1] == flush_suit
+            )
         )
 
     if straight_high:
         return (4, straight_high)
 
-    if triples:
-        triple = triples[0]
+    if trips:
+        return (3, trips[0])
 
-        kickers = sorted(
-            [
-                rank
-                for rank in ranks
-                if rank != triple
-            ],
-            reverse=True
-        )[:2]
-
-        return (
-            3,
-            triple,
-            *kickers
-        )
-
-    pair_ranks = sorted(
-        [
-            rank
-            for rank, count in counts.items()
-            if count >= 2
-        ],
-        reverse=True
-    )
-
-    if len(pair_ranks) >= 2:
-        high_pair = pair_ranks[0]
-        low_pair = pair_ranks[1]
-
-        kicker = max(
-            rank
-            for rank in ranks
-            if rank != high_pair
-            and rank != low_pair
-        )
-
+    if len(pairs) >= 2:
         return (
             2,
-            high_pair,
-            low_pair,
-            kicker
+            pairs[0] * 100 + pairs[1]
         )
 
-    if len(pair_ranks) == 1:
-        pair = pair_ranks[0]
+    if len(pairs) == 1:
+        return (1, pairs[0])
 
-        kickers = sorted(
-            [
-                rank
-                for rank in ranks
-                if rank != pair
-            ],
-            reverse=True
-        )[:3]
-
-        return (
-            1,
-            pair,
-            *kickers
-        )
-
-    return (
-        0,
-        *sorted(ranks, reverse=True)
-    )
+    return (0, max(values))
 
 
-def best_hand(cards):
-    if len(cards) < 5:
-        return (0,)
+def determine_winner():
+    candidates = active_players()
 
-    best = None
+    if len(candidates) == 1:
+        return candidates[0]
 
-    for combo in combinations(cards, 5):
-        score = evaluate_five(combo)
+    if not candidates:
+        return None
 
-        if best is None or score > best:
-            best = score
+    scored = []
 
-    return best
-
-
-def finish_showdown():
-    active = active_players()
-
-    if len(active) == 0:
-        game["started"] = False
-        game["stage"] = "finished"
-        game["current_player"] = None
-        return
-
-    if len(active) == 1:
-        winner = active[0]
-        amount = game["pot"]
-
-        winner.chips += amount
-
-        game["pot"] = 0
-
-        game["winner"] = {
-            "user_id": winner.user_id,
-            "name": winner.name,
-            "amount": amount,
-        }
-
-        game["message"] = (
-            f"{winner.name} wins {amount} chips!"
-        )
-
-        game["started"] = False
-        game["stage"] = "finished"
-        game["current_player"] = None
-
-        return
-
-    rankings = []
-
-    for player in active:
+    for player in candidates:
         cards = (
-            player.cards
+            player.get("cards", [])
             + game["community_cards"]
         )
 
-        score = best_hand(cards)
+        score = evaluate_hand(cards)
 
-        rankings.append(
-            (score, player)
+        scored.append(
+            (
+                score,
+                player
+            )
         )
 
-    rankings.sort(
+    scored.sort(
         key=lambda x: x[0],
         reverse=True
     )
 
-    best_score = rankings[0][0]
+    return scored[0][1]
 
-    winners = [
-        player
-        for score, player in rankings
-        if score == best_score
-    ]
 
-    pot = game["pot"]
+def finish_game():
+    winner = determine_winner()
 
-    share = pot // len(winners)
-    remainder = pot % len(winners)
+    if winner is None:
+        game["winner"] = None
+        game["message"] = "No winner"
+        return
 
-    for i, winner in enumerate(winners):
-        winner.chips += share
+    pot = int(game["pot"])
 
-        if i < remainder:
-            winner.chips += 1
+    winner["chips"] += pot
 
-    if len(winners) == 1:
-        winner = winners[0]
+    hand_text = ""
 
-        game["winner"] = {
-            "user_id": winner.user_id,
-            "name": winner.name,
-            "amount": pot,
-            "hand_score": list(best_score),
-        }
+    cards = (
+        winner.get("cards", [])
+        + game["community_cards"]
+    )
 
-        game["message"] = (
-            f"{winner.name} wins {pot} chips!"
+    if len(cards) >= 5:
+        category = evaluate_hand(cards)[0]
+        hand_text = HAND_NAMES.get(
+            category,
+            "Poker Hand"
         )
 
-    else:
-        names = ", ".join(
-            winner.name
-            for winner in winners
+    game["winner"] = (
+        f"🏆 {winner['name']} wins "
+        f"{pot} chips"
+        + (
+            f" with {hand_text}"
+            if hand_text
+            else ""
         )
+    )
 
-        game["winner"] = {
-            "user_id": winners[0].user_id,
-            "name": names,
-            "amount": pot,
-        }
-
-        game["message"] = (
-            f"Split pot between {names}"
-        )
-
-    game["pot"] = 0
-    game["started"] = False
-    game["stage"] = "finished"
     game["current_player"] = None
+    game["stage"] = "finished"
+    game["started"] = False
+    game["message"] = game["winner"]
 
 
-def advance_stage():
-    collect_bets()
-
-    active = active_players()
-
-    if len(active) <= 1:
-        finish_showdown()
-        return
-
-    if len(game["community_cards"]) == 0:
-        deal_flop()
-        prepare_new_betting_round()
-        return
-
-    if len(game["community_cards"]) == 3:
-        deal_turn()
-        prepare_new_betting_round()
-        return
-
-    if len(game["community_cards"]) == 4:
-        deal_river()
-        prepare_new_betting_round()
-        return
-
-    if len(game["community_cards"]) == 5:
-        game["stage"] = "showdown"
-        finish_showdown()
-
+# =========================================================
+# ROOT / HEALTH
+# =========================================================
 
 @app.get("/")
-def home():
+def root():
     return {
         "status": "online",
         "message": "Poker backend is running"
@@ -532,345 +458,404 @@ def home():
 @app.get("/health")
 def health():
     return {
-        "status": "ok"
+        "status": "ok",
+        "players": len(players),
+        "game_started": game["started"]
     }
 
 
+# =========================================================
+# JOIN
+# =========================================================
+
 @app.post("/join")
-def join_game(
-    user_id: str,
-    name: str = "Player"
-):
-    user_id = str(user_id)
+def join(request: JoinRequest):
 
-    if user_id not in players:
-        players[user_id] = Player(
-            user_id,
-            name
+    existing = find_player(
+        request.user_id
+    )
+
+    if existing:
+        existing["name"] = request.name or existing["name"]
+
+        return {
+            "success": True,
+            "message": "Already joined",
+            "player": serialize_player(existing)
+        }
+
+    if len(players) >= MAX_PLAYERS:
+        raise HTTPException(
+            status_code=400,
+            detail="Table is full"
         )
-    else:
-        players[user_id].name = name
 
-    player = players[user_id]
+    player = {
+        "user_id": str(request.user_id),
+        "name": request.name or "Player",
+        "chips": STARTING_CHIPS,
+        "bet": 0,
+        "folded": False,
+        "all_in": False,
+        "cards": []
+    }
+
+    players.append(player)
 
     return {
         "success": True,
-        "user_id": player.user_id,
-        "name": player.name,
-        "chips": player.chips
+        "message": "Joined poker table",
+        "player": serialize_player(player)
     }
 
+
+# =========================================================
+# PLAYERS
+# =========================================================
 
 @app.get("/players")
 def get_players():
-    return {
-        "players": public_players()
-    }
-
-
-@app.post("/start")
-def start_game():
-    if game["started"]:
-        return {
-            "success": False,
-            "message": "Game already running"
-        }
-
-    active = [
-        player
-        for player in players.values()
-        if player.chips > 0
-    ]
-
-    if len(active) < 2:
-        return {
-            "success": False,
-            "message": "At least 2 players are required"
-        }
-
-    game["deck"] = create_deck()
-    game["community_cards"] = []
-    game["pot"] = 0
-    game["started"] = True
-    game["stage"] = "preflop"
-    game["current_player"] = None
-    game["current_bet"] = 0
-    game["acted_players"] = set()
-    game["winner"] = None
-    game["message"] = ""
-
-    for player in players.values():
-        if player.chips > 0:
-            reset_player_for_hand(player)
-
-            player.cards = [
-                game["deck"].pop(),
-                game["deck"].pop()
-            ]
-
-    active = [
-        player
-        for player in players.values()
-        if len(player.cards) == 2
-        and player.chips > 0
-    ]
-
-    dealer_index = (
-        game["dealer_index"] % len(active)
-    )
-
-    small_blind = active[
-        (dealer_index + 1) % len(active)
-    ]
-
-    big_blind = active[
-        (dealer_index + 2) % len(active)
-    ]
-
-    sb = min(
-        SMALL_BLIND,
-        small_blind.chips
-    )
-
-    small_blind.chips -= sb
-    small_blind.bet += sb
-    small_blind.total_bet += sb
-    game["pot"] += sb
-
-    if small_blind.chips == 0:
-        small_blind.all_in = True
-
-    bb = min(
-        BIG_BLIND,
-        big_blind.chips
-    )
-
-    big_blind.chips -= bb
-    big_blind.bet += bb
-    big_blind.total_bet += bb
-    game["pot"] += bb
-
-    if big_blind.chips == 0:
-        big_blind.all_in = True
-
-    game["current_bet"] = bb
-
-    game["current_player"] = next_active_player(
-        big_blind.user_id
-    )
 
     return {
         "success": True,
-        "message": "Game started",
-        "stage": "preflop",
-        "pot": game["pot"],
-        "current_bet": game["current_bet"],
-        "current_player": game["current_player"],
-        "players": public_players()
+        "players": [
+            serialize_player(p)
+            for p in players
+        ]
     }
 
+
+# =========================================================
+# GAME
+# =========================================================
 
 @app.get("/game")
 def get_game():
-    return {
-        "started": game["started"],
-        "stage": game["stage"],
-        "community_cards": game["community_cards"],
-        "pot": game["pot"],
-        "current_bet": game["current_bet"],
-        "current_player": game["current_player"],
-        "winner": game["winner"],
-        "message": game["message"],
-        "players": public_players()
-    }
 
+    update_message()
+
+    return public_game()
+
+
+# =========================================================
+# MY CARDS
+# =========================================================
 
 @app.get("/my-cards")
 def my_cards(user_id: str):
-    user_id = str(user_id)
 
-    if user_id not in players:
+    player = find_player(user_id)
+
+    if not player:
         return {
             "success": False,
-            "message": "Player not found",
             "cards": []
         }
 
     return {
         "success": True,
-        "user_id": user_id,
-        "cards": players[user_id].cards
+        "cards": list(
+            player.get("cards", [])
+        )
     }
 
 
-@app.post("/action")
-def poker_action(data: Action):
-    action = data.action.lower().strip()
+# =========================================================
+# START GAME
+# =========================================================
 
-    if action not in [
-        "check",
-        "call",
-        "raise",
-        "allin",
-        "fold"
-    ]:
+@app.post("/start")
+def start_game():
+
+    if len(players) < 2:
         return {
             "success": False,
-            "message": "Invalid action"
+            "detail": "At least 2 players are required"
+        }
+
+    reset_deck()
+    reset_player_round_data()
+
+    game["started"] = True
+    game["stage"] = "preflop"
+    game["pot"] = 0
+    game["community_cards"] = []
+    game["winner"] = None
+    game["current_bet"] = BIG_BLIND
+
+    # Deal 2 cards to every player
+    for _ in range(2):
+        for player in players:
+            card = deal_card()
+
+            if card:
+                player["cards"].append(card)
+
+    # Blinds
+    if len(players) >= 2:
+
+        sb = players[0]
+        bb = players[1]
+
+        sb_amount = min(
+            SMALL_BLIND,
+            sb["chips"]
+        )
+
+        bb_amount = min(
+            BIG_BLIND,
+            bb["chips"]
+        )
+
+        sb["chips"] -= sb_amount
+        sb["bet"] += sb_amount
+
+        bb["chips"] -= bb_amount
+        bb["bet"] += bb_amount
+
+    collect_bets()
+
+    # First action after big blind
+    if len(players) > 2:
+        game["current_player"] = str(
+            players[2]["user_id"]
+        )
+    else:
+        game["current_player"] = str(
+            players[0]["user_id"]
+        )
+
+    game["message"] = "Game started"
+
+    return {
+        "success": True,
+        "message": "Poker game started",
+        "game": public_game()
+    }
+
+
+# =========================================================
+# ACTION
+# =========================================================
+
+@app.post("/action")
+def action(request: ActionRequest):
+
+    player = find_player(
+        request.user_id
+    )
+
+    if not player:
+        return {
+            "success": False,
+            "detail": "Player not found"
         }
 
     if not game["started"]:
         return {
             "success": False,
-            "message": "Game is not running"
+            "detail": "Game has not started"
         }
 
-    user_id = str(data.user_id)
-
-    if user_id not in players:
+    if str(game["current_player"]) != str(
+        request.user_id
+    ):
         return {
             "success": False,
-            "message": "Player not found"
+            "detail": "It is not your turn"
         }
 
-    player = players[user_id]
+    action_name = request.action.lower().strip()
 
-    if game["current_player"] != user_id:
-        return {
-            "success": False,
-            "message": "Not your turn",
-            "current_player": game["current_player"]
-        }
+    # -------------------------
+    # FOLD
+    # -------------------------
 
-    if player.folded:
-        return {
-            "success": False,
-            "message": "Player folded"
-        }
+    if action_name == "fold":
 
-    if player.all_in:
-        return {
-            "success": False,
-            "message": "Already all-in"
-        }
+        player["folded"] = True
 
-    if action == "check":
+        remaining = active_players()
 
-        if player.bet != game["current_bet"]:
+        if len(remaining) <= 1:
+            finish_game()
+
             return {
-                "success": False,
-                "message": "Cannot check. Call required."
+                "success": True,
+                "message": "You folded",
+                "game": public_game()
             }
 
-        game["acted_players"].add(user_id)
+    # -------------------------
+    # CHECK
+    # -------------------------
 
-    elif action == "call":
+    elif action_name == "check":
 
-        needed = (
-            game["current_bet"]
-            - player.bet
+        max_bet = max(
+            [p["bet"] for p in players],
+            default=0
         )
+
+        if player["bet"] < max_bet:
+            return {
+                "success": False,
+                "detail": "You cannot check"
+            }
+
+        game["message"] = (
+            f"{player['name']} checked"
+        )
+
+    # -------------------------
+    # CALL
+    # -------------------------
+
+    elif action_name == "call":
+
+        max_bet = max(
+            [p["bet"] for p in players],
+            default=0
+        )
+
+        needed = max_bet - player["bet"]
 
         if needed <= 0:
             return {
                 "success": False,
-                "message": "Nothing to call. Check instead."
+                "detail": "Nothing to call"
             }
 
         amount = min(
             needed,
-            player.chips
+            player["chips"]
         )
 
-        player.chips -= amount
-        player.bet += amount
-        player.total_bet += amount
-        game["pot"] += amount
+        player["chips"] -= amount
+        player["bet"] += amount
 
-        game["acted_players"].add(user_id)
+        if player["chips"] == 0:
+            player["all_in"] = True
 
-        if player.chips == 0:
-            player.all_in = True
+        collect_bets()
 
-    elif action == "raise":
+        game["message"] = (
+            f"{player['name']} called"
+        )
 
-        target = int(data.amount)
+    # -------------------------
+    # RAISE
+    # -------------------------
 
-        if target <= game["current_bet"]:
+    elif action_name == "raise":
+
+        if request.amount is None:
             return {
                 "success": False,
-                "message": "Raise must be higher than current bet."
+                "detail": "Raise amount required"
             }
 
-        needed = target - player.bet
+        amount = int(request.amount)
 
-        if needed > player.chips:
+        if amount <= player["bet"]:
             return {
                 "success": False,
-                "message": "Not enough chips."
+                "detail": "Raise must be higher than current bet"
             }
 
-        player.chips -= needed
-        player.bet += needed
-        player.total_bet += needed
-        game["pot"] += needed
+        additional = (
+            amount - player["bet"]
+        )
 
-        game["current_bet"] = target
+        if additional > player["chips"]:
+            return {
+                "success": False,
+                "detail": "Not enough chips"
+            }
 
-        game["acted_players"] = {user_id}
+        player["chips"] -= additional
+        player["bet"] = amount
 
-        if player.chips == 0:
-            player.all_in = True
+        if player["chips"] == 0:
+            player["all_in"] = True
 
-    elif action == "allin":
+        game["current_bet"] = amount
 
-        amount = player.chips
+        collect_bets()
 
-        player.chips = 0
-        player.bet += amount
-        player.total_bet += amount
-        game["pot"] += amount
-        player.all_in = True
+        game["message"] = (
+            f"{player['name']} raised to {amount}"
+        )
 
-        if player.bet > game["current_bet"]:
-            game["current_bet"] = player.bet
-            game["acted_players"] = {user_id}
-        else:
-            game["acted_players"].add(user_id)
+    # -------------------------
+    # ALL IN
+    # -------------------------
 
-    elif action == "fold":
+    elif action_name in ["all-in", "allin"]:
 
-        player.folded = True
-        game["acted_players"].add(user_id)
+        amount = player["chips"]
 
-    if len(active_players()) <= 1:
+        player["bet"] += amount
+        player["chips"] = 0
+        player["all_in"] = True
 
-        finish_showdown()
+        if player["bet"] > game["current_bet"]:
+            game["current_bet"] = player["bet"]
 
-    elif betting_round_finished():
+        collect_bets()
 
-        advance_stage()
+        game["message"] = (
+            f"{player['name']} is ALL-IN"
+        )
 
     else:
 
-        game["current_player"] = next_active_player(
-            user_id
-        )
+        return {
+            "success": False,
+            "detail": "Unknown action"
+        }
+
+    # Next player
+    next_player = next_active_player(
+        player["user_id"]
+    )
+
+    game["current_player"] = next_player
+
+    # If nobody can act anymore
+    available = [
+        p for p in active_players()
+        if not p.get("all_in", False)
+        and p.get("chips", 0) > 0
+    ]
+
+    if not available:
+
+        # Automatically complete board
+        while len(game["community_cards"]) < 5:
+            card = deal_card()
+
+            if not card:
+                break
+
+            game["community_cards"].append(card)
+
+        game["stage"] = "river"
+
+        collect_bets()
+
+        finish_game()
 
     return {
         "success": True,
-        "action": action,
-        "user_id": user_id,
-        "chips": player.chips,
-        "pot": game["pot"],
-        "stage": game["stage"],
-        "current_bet": game["current_bet"],
-        "current_player": game["current_player"],
-        "community_cards": game["community_cards"],
-        "winner": game["winner"],
-        "players": public_players()
+        "message": game["message"],
+        "game": public_game()
     }
 
+
+# =========================================================
+# NEXT CARD
+# =========================================================
 
 @app.post("/next-card")
 def next_card():
@@ -878,80 +863,124 @@ def next_card():
     if not game["started"]:
         return {
             "success": False,
-            "message": "Game has not started"
+            "detail": "Game has not started"
         }
 
-    if len(game["community_cards"]) == 0:
+    current_count = len(
+        game["community_cards"]
+    )
 
-        cards = deal_flop()
+    # PREFLOP -> FLOP
+    # IMPORTANT:
+    # THREE CARDS ARE DEALT TOGETHER
+    if current_count == 0:
 
-        prepare_new_betting_round()
+        cards = []
 
-        return {
-            "success": True,
-            "stage": "flop",
-            "new_cards": cards,
-            "community_cards": game["community_cards"],
-            "current_player": game["current_player"]
-        }
+        for _ in range(3):
+            card = deal_card()
 
-    if len(game["community_cards"]) == 3:
+            if card:
+                cards.append(card)
 
-        cards = deal_turn()
+        game["community_cards"].extend(
+            cards
+        )
 
-        prepare_new_betting_round()
+        game["stage"] = "flop"
+        game["message"] = "Flop dealt: 3 cards"
 
-        return {
-            "success": True,
-            "stage": "turn",
-            "new_cards": cards,
-            "community_cards": game["community_cards"],
-            "current_player": game["current_player"]
-        }
+    # FLOP -> TURN
+    elif current_count == 3:
 
-    if len(game["community_cards"]) == 4:
+        card = deal_card()
 
-        cards = deal_river()
+        if not card:
+            return {
+                "success": False,
+                "detail": "No cards left"
+            }
 
-        prepare_new_betting_round()
+        game["community_cards"].append(
+            card
+        )
 
-        return {
-            "success": True,
-            "stage": "river",
-            "new_cards": cards,
-            "community_cards": game["community_cards"],
-            "current_player": game["current_player"]
-        }
+        game["stage"] = "turn"
+        game["message"] = "Turn dealt"
+
+    # TURN -> RIVER
+    elif current_count == 4:
+
+        card = deal_card()
+
+        if not card:
+            return {
+                "success": False,
+                "detail": "No cards left"
+            }
+
+        game["community_cards"].append(
+            card
+        )
+
+        game["stage"] = "river"
+        game["message"] = "River dealt"
+
+    # RIVER -> FINISH
+    elif current_count == 5:
+
+        collect_bets()
+        finish_game()
 
     return {
-        "success": False,
-        "message": "All community cards dealt"
+        "success": True,
+        "message": game["message"],
+        "game": public_game()
     }
 
+
+# =========================================================
+# RESET
+# =========================================================
 
 @app.post("/reset")
 def reset_game():
 
     game["started"] = False
-    game["deck"] = []
-    game["community_cards"] = []
-    game["pot"] = 0
     game["stage"] = "waiting"
+    game["pot"] = 0
+    game["community_cards"] = []
+    game["deck"] = []
     game["current_player"] = None
-    game["current_bet"] = 0
-    game["acted_players"] = set()
+    game["current_bet"] = BIG_BLIND
     game["winner"] = None
-    game["message"] = ""
+    game["message"] = "Waiting for game"
 
-    for player in players.values():
-        player.cards = []
-        player.folded = False
-        player.all_in = False
-        player.bet = 0
-        player.total_bet = 0
+    for player in players:
+
+        player["chips"] = STARTING_CHIPS
+        player["bet"] = 0
+        player["folded"] = False
+        player["all_in"] = False
+        player["cards"] = []
 
     return {
         "success": True,
         "message": "Game reset",
-        "players": public_players()
+        "game": public_game()
     }
+
+
+# =========================================================
+# RUN
+# =========================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )
