@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import random
 import itertools
 import asyncio
+import time
 from typing import Optional
 
 
@@ -31,6 +32,8 @@ STARTING_CHIPS = 1000
 SMALL_BLIND = 10
 BIG_BLIND = 20
 MAX_PLAYERS = 6
+
+TURN_TIME = 15
 
 
 BOT_NAMES = [
@@ -68,6 +71,15 @@ game = {
 
 
 # =========================================================
+# TIMER DATA
+# =========================================================
+
+turn_deadline = None
+turn_token = 0
+turn_task = None
+
+
+# =========================================================
 # MODELS
 # =========================================================
 
@@ -83,22 +95,236 @@ class ActionRequest(BaseModel):
 
 
 # =========================================================
+# TIMER HELPERS
+# =========================================================
+
+def cancel_turn_timer():
+
+    global turn_task
+    global turn_token
+    global turn_deadline
+
+    turn_token += 1
+
+    turn_deadline = None
+
+    if turn_task and not turn_task.done():
+
+        turn_task.cancel()
+
+    turn_task = None
+
+
+def get_remaining_time():
+
+    if not game["started"]:
+        return 0
+
+    if not game["current_player"]:
+        return 0
+
+    if turn_deadline is None:
+        return 0
+
+    remaining = turn_deadline - time.monotonic()
+
+    if remaining <= 0:
+        return 0
+
+    return int(remaining + 0.999)
+
+
+async def turn_timer_worker(
+    player_id,
+    token
+):
+
+    global turn_deadline
+
+    try:
+
+        await asyncio.sleep(TURN_TIME)
+
+    except asyncio.CancelledError:
+
+        return
+
+    # Make sure this is still the same timer.
+    if token != turn_token:
+        return
+
+    # Game may have ended.
+    if not game["started"]:
+        return
+
+    # Turn may have changed.
+    if game["current_player"] != player_id:
+        return
+
+    player = players.get(player_id)
+
+    if not player:
+        return
+
+    # -----------------------------------------------------
+    # TIME IS UP
+    # -----------------------------------------------------
+
+    turn_deadline = None
+
+    # If player somehow folded/all-in, skip safely.
+    if player["folded"] or player["all_in"]:
+
+        nxt = next_active_player(player_id)
+
+        if nxt:
+
+            game["current_player"] = nxt
+
+            schedule_turn_timer(nxt)
+
+        else:
+
+            advance_street_if_needed()
+
+        return
+
+    # -----------------------------------------------------
+    # BOT TIMEOUT
+    # -----------------------------------------------------
+
+    if player.get("is_bot", False):
+
+        bot_action, bot_amount = bot_decision(player)
+
+        result = process_action(
+            player_id,
+            bot_action,
+            bot_amount
+        )
+
+    # -----------------------------------------------------
+    # HUMAN TIMEOUT
+    # -----------------------------------------------------
+
+    else:
+
+        current_bet = game["current_bet"]
+
+        call_amount = max(
+            0,
+            current_bet - player["bet"]
+        )
+
+        # If check is possible:
+        # automatically check.
+        if call_amount == 0:
+
+            result = process_action(
+                player_id,
+                "check",
+                0
+            )
+
+        # Otherwise automatically fold.
+        else:
+
+            result = process_action(
+                player_id,
+                "fold",
+                0
+            )
+
+    # -----------------------------------------------------
+    # START NEXT PLAYER TIMER
+    # -----------------------------------------------------
+
+    if result.get("success"):
+
+        if (
+            game["started"]
+            and game["current_player"]
+        ):
+
+            schedule_turn_timer(
+                game["current_player"]
+            )
+
+
+def schedule_turn_timer(player_id):
+
+    global turn_task
+    global turn_token
+    global turn_deadline
+
+    cancel_turn_timer()
+
+    if not game["started"]:
+        return
+
+    if not player_id:
+        return
+
+    if player_id not in players:
+        return
+
+    player = players[player_id]
+
+    if player["folded"]:
+        return
+
+    if player["all_in"]:
+        return
+
+    turn_token += 1
+
+    current_token = turn_token
+
+    turn_deadline = (
+        time.monotonic() + TURN_TIME
+    )
+
+    try:
+
+        loop = asyncio.get_running_loop()
+
+        turn_task = loop.create_task(
+            turn_timer_worker(
+                player_id,
+                current_token
+            )
+        )
+
+    except RuntimeError:
+
+        turn_task = None
+
+
+# =========================================================
 # CARD FUNCTIONS
 # =========================================================
 
 def create_deck():
-    return [rank + suit for rank in RANKS for suit in SUITS]
+
+    return [
+        rank + suit
+        for rank in RANKS
+        for suit in SUITS
+    ]
 
 
 def card_rank(card):
+
     return RANKS.index(card[0]) + 2
 
 
 def card_suit(card):
+
     return card[1]
 
 
 def deal_card():
+
     if not game["deck"]:
         return None
 
@@ -110,102 +336,224 @@ def deal_card():
 # =========================================================
 
 def evaluate_five(cards):
-    values = sorted([card_rank(c) for c in cards], reverse=True)
+
+    values = sorted(
+        [card_rank(c) for c in cards],
+        reverse=True
+    )
 
     counts = {}
-    for v in values:
-        counts[v] = counts.get(v, 0) + 1
 
-    unique = sorted(set(values), reverse=True)
+    for v in values:
+
+        counts[v] = (
+            counts.get(v, 0) + 1
+        )
+
+    unique = sorted(
+        set(values),
+        reverse=True
+    )
 
     straight_high = None
 
     if 14 in unique:
+
         unique.append(1)
 
-    for i in range(len(unique) - 4):
+    for i in range(
+        len(unique) - 4
+    ):
+
         group = unique[i:i + 5]
+
         if group[0] - group[4] == 4:
+
             straight_high = group[0]
+
             break
 
-    flush = len(set(card_suit(c) for c in cards)) == 1
+    flush = (
+        len(
+            set(
+                card_suit(c)
+                for c in cards
+            )
+        ) == 1
+    )
 
     if flush and straight_high:
-        return (8, straight_high)
+
+        return (
+            8,
+            straight_high
+        )
 
     quads = sorted(
-        [v for v, c in counts.items() if c == 4],
+        [
+            v
+            for v, c in counts.items()
+            if c == 4
+        ],
         reverse=True
     )
 
     if quads:
-        kicker = max(v for v in values if v != quads[0])
-        return (7, quads[0], kicker)
+
+        kicker = max(
+            v
+            for v in values
+            if v != quads[0]
+        )
+
+        return (
+            7,
+            quads[0],
+            kicker
+        )
 
     trips = sorted(
-        [v for v, c in counts.items() if c == 3],
+        [
+            v
+            for v, c in counts.items()
+            if c == 3
+        ],
         reverse=True
     )
 
     pairs = sorted(
-        [v for v, c in counts.items() if c == 2],
+        [
+            v
+            for v, c in counts.items()
+            if c == 2
+        ],
         reverse=True
     )
 
     if trips and pairs:
-        return (6, trips[0], pairs[0])
+
+        return (
+            6,
+            trips[0],
+            pairs[0]
+        )
 
     if len(trips) >= 2:
-        return (6, trips[0], trips[1])
+
+        return (
+            6,
+            trips[0],
+            trips[1]
+        )
 
     if flush:
-        return (5, *values)
+
+        return (
+            5,
+            *values
+        )
 
     if straight_high:
-        return (4, straight_high)
+
+        return (
+            4,
+            straight_high
+        )
 
     if trips:
+
         kickers = sorted(
-            [v for v in values if v != trips[0]],
+            [
+                v
+                for v in values
+                if v != trips[0]
+            ],
             reverse=True
         )[:2]
 
-        return (3, trips[0], *kickers)
+        return (
+            3,
+            trips[0],
+            *kickers
+        )
 
     if len(pairs) >= 2:
+
         high_pair = pairs[0]
         low_pair = pairs[1]
-        kicker = max(v for v in values if v != high_pair and v != low_pair)
 
-        return (2, high_pair, low_pair, kicker)
+        kicker = max(
+            v
+            for v in values
+            if v != high_pair
+            and v != low_pair
+        )
+
+        return (
+            2,
+            high_pair,
+            low_pair,
+            kicker
+        )
 
     if len(pairs) == 1:
+
         pair = pairs[0]
+
         kickers = sorted(
-            [v for v in values if v != pair],
+            [
+                v
+                for v in values
+                if v != pair
+            ],
             reverse=True
         )[:3]
 
-        return (1, pair, *kickers)
+        return (
+            1,
+            pair,
+            *kickers
+        )
 
-    return (0, *values)
+    return (
+        0,
+        *values
+    )
 
 
 def evaluate_hand(cards):
+
     if len(cards) < 5:
+
         values = sorted(
-            [card_rank(c) for c in cards],
+            [
+                card_rank(c)
+                for c in cards
+            ],
             reverse=True
         )
-        return (0, *values)
+
+        return (
+            0,
+            *values
+        )
 
     best = None
 
-    for combo in itertools.combinations(cards, 5):
-        score = evaluate_five(combo)
+    for combo in itertools.combinations(
+        cards,
+        5
+    ):
 
-        if best is None or score > best:
+        score = evaluate_five(
+            combo
+        )
+
+        if (
+            best is None
+            or score > best
+        ):
+
             best = score
 
     return best
@@ -216,15 +564,20 @@ def evaluate_hand(cards):
 # =========================================================
 
 def active_players():
+
     return [
-        p for p in players.values()
-        if not p["folded"] and p["chips"] > 0
+        p
+        for p in players.values()
+        if not p["folded"]
+        and p["chips"] > 0
     ]
 
 
 def players_in_hand():
+
     return [
-        p for p in players.values()
+        p
+        for p in players.values()
         if not p["folded"]
     ]
 
@@ -234,30 +587,52 @@ def players_in_hand():
 # =========================================================
 
 def ordered_player_ids():
+
     return list(players.keys())
 
 
-def next_active_player(current_id):
+def next_active_player(
+    current_id
+):
+
     ids = ordered_player_ids()
 
     if not ids:
+
         return None
 
     try:
-        index = ids.index(current_id)
+
+        index = ids.index(
+            current_id
+        )
+
     except ValueError:
+
         index = -1
 
-    for step in range(1, len(ids) + 1):
-        candidate_id = ids[(index + step) % len(ids)]
-        p = players.get(candidate_id)
+    for step in range(
+        1,
+        len(ids) + 1
+    ):
+
+        candidate_id = ids[
+            (index + step) % len(ids)
+        ]
+
+        p = players.get(
+            candidate_id
+        )
 
         if not p:
             continue
 
+        # CRITICAL:
+        # Folded players are skipped.
         if p["folded"]:
             continue
 
+        # All-in players are skipped.
         if p["all_in"]:
             continue
 
@@ -270,28 +645,43 @@ def next_active_player(current_id):
 
 
 def first_player_postflop():
+
     ids = ordered_player_ids()
 
     if not ids:
         return None
 
-    dealer_id = ids[game["dealer_index"] % len(ids)]
+    dealer_id = ids[
+        game["dealer_index"] % len(ids)
+    ]
 
-    return next_active_player(dealer_id)
+    return next_active_player(
+        dealer_id
+    )
 
 
 # =========================================================
-# BLINDS
+# BETS
 # =========================================================
 
-def put_bet(player, amount):
-    amount = min(amount, player["chips"])
+def put_bet(
+    player,
+    amount
+):
+
+    amount = min(
+        amount,
+        player["chips"]
+    )
 
     player["chips"] -= amount
+
     player["bet"] += amount
+
     player["total_bet"] += amount
 
     if player["chips"] == 0:
+
         player["all_in"] = True
 
     game["pot"] += amount
@@ -299,8 +689,15 @@ def put_bet(player, amount):
     return amount
 
 
-def post_blind(player, amount):
-    return put_bet(player, amount)
+def post_blind(
+    player,
+    amount
+):
+
+    return put_bet(
+        player,
+        amount
+    )
 
 
 # =========================================================
@@ -308,7 +705,9 @@ def post_blind(player, amount):
 # =========================================================
 
 def reset_street():
+
     for p in players.values():
+
         p["bet"] = 0
         p["acted"] = False
 
@@ -316,56 +715,89 @@ def reset_street():
 
 
 def deal_flop():
-    if len(game["community_cards"]) >= 3:
+
+    if len(
+        game["community_cards"]
+    ) >= 3:
+
         return
 
     if game["deck"]:
+
         game["deck"].pop()
 
     for _ in range(3):
+
         card = deal_card()
+
         if card:
-            game["community_cards"].append(card)
+
+            game[
+                "community_cards"
+            ].append(card)
 
 
 def deal_turn():
+
     if game["deck"]:
+
         game["deck"].pop()
 
     card = deal_card()
 
     if card:
-        game["community_cards"].append(card)
+
+        game[
+            "community_cards"
+        ].append(card)
 
 
 def deal_river():
+
     if game["deck"]:
+
         game["deck"].pop()
 
     card = deal_card()
 
     if card:
-        game["community_cards"].append(card)
+
+        game[
+            "community_cards"
+        ].append(card)
 
 
-def start_street(stage):
+def start_street(
+    stage
+):
+
+    cancel_turn_timer()
+
     reset_street()
 
     game["stage"] = stage
 
     if stage == "flop":
+
         deal_flop()
 
     elif stage == "turn":
+
         deal_turn()
 
     elif stage == "river":
+
         deal_river()
 
     first = first_player_postflop()
 
     if first:
+
         game["current_player"] = first
+
+        schedule_turn_timer(
+            first
+        )
 
 
 # =========================================================
@@ -373,28 +805,38 @@ def start_street(stage):
 # =========================================================
 
 def betting_finished():
+
     alive = [
-        p for p in players.values()
+        p
+        for p in players.values()
         if not p["folded"]
     ]
 
     playable = [
-        p for p in alive
+        p
+        for p in alive
         if not p["all_in"]
     ]
 
     if len(alive) <= 1:
+
         return True
 
     if not playable:
+
         return True
 
     for p in playable:
 
         if not p["acted"]:
+
             return False
 
-        if p["bet"] != game["current_bet"]:
+        if (
+            p["bet"]
+            != game["current_bet"]
+        ):
+
             return False
 
     return True
@@ -402,27 +844,46 @@ def betting_finished():
 
 def advance_street_if_needed():
 
-    if len(players_in_hand()) <= 1:
+    if len(
+        players_in_hand()
+    ) <= 1:
+
         finish_hand()
+
         return True
 
     if not betting_finished():
+
         return False
 
     if game["stage"] == "preflop":
-        start_street("flop")
+
+        start_street(
+            "flop"
+        )
+
         return True
 
     if game["stage"] == "flop":
-        start_street("turn")
+
+        start_street(
+            "turn"
+        )
+
         return True
 
     if game["stage"] == "turn":
-        start_street("river")
+
+        start_street(
+            "river"
+        )
+
         return True
 
     if game["stage"] == "river":
+
         finish_hand()
+
         return True
 
     return False
@@ -432,157 +893,303 @@ def advance_street_if_needed():
 # BOT AI
 # =========================================================
 
-def bot_strength(player):
+def bot_strength(
+    player
+):
 
     cards = player["cards"]
 
     if len(cards) < 2:
+
         return 0.20
 
-    a = card_rank(cards[0])
-    b = card_rank(cards[1])
+    a = card_rank(
+        cards[0]
+    )
+
+    b = card_rank(
+        cards[1]
+    )
 
     strength = 0.20
 
     if a == b:
+
         strength += 0.45
 
     if a >= 12:
+
         strength += 0.15
 
     if b >= 12:
+
         strength += 0.15
 
-    if card_suit(cards[0]) == card_suit(cards[1]):
+    if (
+        card_suit(cards[0])
+        ==
+        card_suit(cards[1])
+    ):
+
         strength += 0.10
 
     if abs(a - b) <= 2:
+
         strength += 0.05
 
-    community = game["community_cards"]
+    community = game[
+        "community_cards"
+    ]
 
     if community:
-        score = evaluate_hand(cards + community)
+
+        score = evaluate_hand(
+            cards + community
+        )
 
         category = score[0]
 
         if category >= 5:
+
             strength = 0.95
+
         elif category == 4:
+
             strength = 0.90
+
         elif category == 3:
+
             strength = 0.85
+
         elif category == 2:
+
             strength = 0.75
+
         elif category == 1:
-            strength = max(strength, 0.55)
 
-    return min(strength, 0.99)
+            strength = max(
+                strength,
+                0.55
+            )
+
+    return min(
+        strength,
+        0.99
+    )
 
 
-def bot_decision(player):
+def bot_decision(
+    player
+):
 
-    strength = bot_strength(player)
+    strength = bot_strength(
+        player
+    )
 
-    current = game["current_bet"]
+    current = game[
+        "current_bet"
+    ]
+
     my_bet = player["bet"]
 
-    to_call = max(0, current - my_bet)
+    to_call = max(
+        0,
+        current - my_bet
+    )
 
-    # Very weak hand
     if strength < 0.30:
 
         if to_call == 0:
-            return "check", 0
 
-        if to_call <= max(10, player["chips"] * 0.03):
-            return "call", 0
+            return (
+                "check",
+                0
+            )
+
+        if to_call <= max(
+            10,
+            player["chips"] * 0.03
+        ):
+
+            return (
+                "call",
+                0
+            )
 
         if random.random() < 0.20:
-            return "call", 0
 
-        return "fold", 0
+            return (
+                "call",
+                0
+            )
 
-    # Medium hand
+        return (
+            "fold",
+            0
+        )
+
     if strength < 0.60:
 
         if to_call == 0:
+
             if random.random() < 0.25:
-                target = current + BIG_BLIND
-                return "raise", target
 
-            return "check", 0
+                target = (
+                    current
+                    + BIG_BLIND
+                )
 
-        if to_call <= player["chips"] * 0.20:
-            return "call", 0
+                return (
+                    "raise",
+                    target
+                )
 
-        return "fold", 0
+            return (
+                "check",
+                0
+            )
 
-    # Strong hand
+        if (
+            to_call
+            <= player["chips"] * 0.20
+        ):
+
+            return (
+                "call",
+                0
+            )
+
+        return (
+            "fold",
+            0
+        )
+
     if strength < 0.80:
 
         if to_call == 0:
-            target = max(BIG_BLIND * 2, current + BIG_BLIND * 2)
-            return "raise", target
 
-        if to_call <= player["chips"] * 0.40:
-            return "call", 0
+            target = max(
+                BIG_BLIND * 2,
+                current
+                + BIG_BLIND * 2
+            )
+
+            return (
+                "raise",
+                target
+            )
+
+        if (
+            to_call
+            <= player["chips"] * 0.40
+        ):
+
+            return (
+                "call",
+                0
+            )
 
         if random.random() < 0.25:
-            return "allin", 0
 
-        return "fold", 0
+            return (
+                "allin",
+                0
+            )
 
-    # Very strong
+        return (
+            "fold",
+            0
+        )
+
     if random.random() < 0.35:
-        return "allin", 0
+
+        return (
+            "allin",
+            0
+        )
 
     target = max(
         current + BIG_BLIND * 3,
-        int(player["bet"] + player["chips"] * 0.40)
+        int(
+            player["bet"]
+            + player["chips"] * 0.40
+        )
     )
 
-    return "raise", target
+    return (
+        "raise",
+        target
+    )
 
 
 # =========================================================
 # PROCESS ACTION
 # =========================================================
 
-def process_action(user_id, action, amount=0):
+def process_action(
+    user_id,
+    action,
+    amount=0
+):
 
-    player = players.get(user_id)
+    player = players.get(
+        user_id
+    )
 
     if not player:
+
         return {
             "success": False,
             "message": "Player not found"
         }
 
-    # CRITICAL FIX:
-    # Only the exact current_player can act.
-    if game["current_player"] != user_id:
+    # -----------------------------------------------------
+    # ONLY CURRENT PLAYER CAN ACT
+    # -----------------------------------------------------
+
+    if (
+        game["current_player"]
+        != user_id
+    ):
+
         return {
             "success": False,
             "message": "It is not your turn"
         }
 
+    # -----------------------------------------------------
+    # FOLDED PLAYER CAN NEVER ACT
+    # -----------------------------------------------------
+
     if player["folded"]:
+
         return {
             "success": False,
-            "message": "Player folded"
+            "message": "Player already folded"
         }
 
     if player["all_in"]:
+
         return {
             "success": False,
             "message": "Player is all-in"
         }
 
-    action = action.lower().strip()
+    action = (
+        action
+        .lower()
+        .strip()
+    )
 
-    current_bet = game["current_bet"]
-    call_amount = max(0, current_bet - player["bet"])
+    current_bet = game[
+        "current_bet"
+    ]
+
+    call_amount = max(
+        0,
+        current_bet
+        - player["bet"]
+    )
 
     # -----------------------------------------------------
     # FOLD
@@ -591,13 +1198,25 @@ def process_action(user_id, action, amount=0):
     if action == "fold":
 
         player["folded"] = True
+
         player["acted"] = True
 
-        if len(players_in_hand()) <= 1:
+        # IMPORTANT:
+        # Cancel current timer immediately.
+        cancel_turn_timer()
+
+        # If only one player remains,
+        # finish immediately.
+        if len(
+            players_in_hand()
+        ) <= 1:
+
             finish_hand()
+
             return {
                 "success": True,
-                "message": "Folded. Hand finished."
+                "message":
+                    "Folded. Hand finished."
             }
 
     # -----------------------------------------------------
@@ -607,12 +1226,16 @@ def process_action(user_id, action, amount=0):
     elif action == "check":
 
         if call_amount > 0:
+
             return {
                 "success": False,
-                "message": "Cannot check. You must call."
+                "message":
+                    "Cannot check. You must call."
             }
 
         player["acted"] = True
+
+        cancel_turn_timer()
 
     # -----------------------------------------------------
     # CALL
@@ -621,9 +1244,15 @@ def process_action(user_id, action, amount=0):
     elif action == "call":
 
         if call_amount > 0:
-            put_bet(player, call_amount)
+
+            put_bet(
+                player,
+                call_amount
+            )
 
         player["acted"] = True
+
+        cancel_turn_timer()
 
     # -----------------------------------------------------
     # RAISE
@@ -632,45 +1261,81 @@ def process_action(user_id, action, amount=0):
     elif action == "raise":
 
         try:
-            target_bet = int(amount or 0)
+
+            target_bet = int(
+                amount or 0
+            )
+
         except:
+
             target_bet = 0
 
         minimum_raise = max(
             BIG_BLIND,
-            current_bet + BIG_BLIND
+            current_bet
+            + BIG_BLIND
         )
 
         if target_bet <= current_bet:
+
             return {
                 "success": False,
-                "message": f"Raise must be above {current_bet}"
+                "message":
+                    f"Raise must be above {current_bet}"
             }
 
         if target_bet < minimum_raise:
+
             target_bet = minimum_raise
 
-        additional = target_bet - player["bet"]
+        additional = (
+            target_bet
+            - player["bet"]
+        )
 
         if additional <= 0:
+
             return {
                 "success": False,
-                "message": "Invalid raise"
+                "message":
+                    "Invalid raise"
             }
 
         if additional >= player["chips"]:
-            put_bet(player, player["chips"])
-            game["current_bet"] = player["bet"]
-        else:
-            put_bet(player, additional)
-            game["current_bet"] = player["bet"]
 
-        # Everyone must act again after a raise.
+            put_bet(
+                player,
+                player["chips"]
+            )
+
+            game[
+                "current_bet"
+            ] = player["bet"]
+
+        else:
+
+            put_bet(
+                player,
+                additional
+            )
+
+            game[
+                "current_bet"
+            ] = player["bet"]
+
+        # Everyone else must act again.
         for p in players.values():
-            if not p["folded"] and not p["all_in"]:
+
+            if (
+                not p["folded"]
+                and not p["all_in"]
+            ):
+
                 p["acted"] = False
 
         player["acted"] = True
+
+        cancel_turn_timer()
 
     # -----------------------------------------------------
     # ALL IN
@@ -679,111 +1344,89 @@ def process_action(user_id, action, amount=0):
     elif action == "allin":
 
         if player["chips"] <= 0:
+
             player["all_in"] = True
+
             player["acted"] = True
 
         else:
 
-            put_bet(player, player["chips"])
+            put_bet(
+                player,
+                player["chips"]
+            )
 
-            if player["bet"] > game["current_bet"]:
+            if (
+                player["bet"]
+                > game["current_bet"]
+            ):
 
-                game["current_bet"] = player["bet"]
+                game[
+                    "current_bet"
+                ] = player["bet"]
 
                 for p in players.values():
-                    if not p["folded"] and not p["all_in"]:
+
+                    if (
+                        not p["folded"]
+                        and not p["all_in"]
+                    ):
+
                         p["acted"] = False
 
             player["acted"] = True
+
+        cancel_turn_timer()
 
     else:
 
         return {
             "success": False,
-            "message": "Unknown action"
+            "message":
+                "Unknown action"
         }
 
     # -----------------------------------------------------
-    # NEXT PLAYER
+    # CHECK STREET
     # -----------------------------------------------------
 
     if advance_street_if_needed():
+
         return {
             "success": True,
-            "message": "Action accepted"
+            "message":
+                "Action accepted"
         }
 
-    nxt = next_active_player(user_id)
+    # -----------------------------------------------------
+    # FIND NEXT ACTIVE PLAYER
+    # -----------------------------------------------------
+
+    nxt = next_active_player(
+        user_id
+    )
 
     if nxt:
-        game["current_player"] = nxt
+
+        # IMPORTANT:
+        # This can NEVER be a folded player.
+        game[
+            "current_player"
+        ] = nxt
+
+        schedule_turn_timer(
+            nxt
+        )
+
     else:
+
         advance_street_if_needed()
 
     return {
         "success": True,
-        "message": "Action accepted"
+        "message":
+            "Action accepted"
     }
-
-
-# =========================================================
-# BOT LOOP
-# =========================================================
-
-async def run_bots():
-
-    safety = 0
-
-    while game["started"] and safety < 100:
-
-        safety += 1
-
-        current_id = game["current_player"]
-
-        if not current_id:
-            break
-
-        player = players.get(current_id)
-
-        if not player:
-            break
-
-        # IMPORTANT:
-        # If current player is human, stop.
-        # The frontend will wait for human action.
-        if not player.get("is_bot", False):
-            break
-
-        await asyncio.sleep(random.uniform(0.8, 1.5))
-
-        # Re-check after waiting.
-        if game["current_player"] != current_id:
-            continue
-
-        action, amount = bot_decision(player)
-
-        result = process_action(
-            current_id,
-            action,
-            amount
-        )
-
-        if not result.get("success"):
-            # Safety fallback.
-            if game["current_player"] == current_id:
-
-                fallback = "check"
-
-                if game["current_bet"] > player["bet"]:
-                    fallback = "call"
-
-                process_action(
-                    current_id,
-                    fallback,
-                    0
-                )
-
-    return
 
 
 # =========================================================
@@ -793,7 +1436,8 @@ async def run_bots():
 def add_bots():
 
     existing_bot_count = len([
-        p for p in players.values()
+        p
+        for p in players.values()
         if p.get("is_bot")
     ])
 
@@ -801,26 +1445,54 @@ def add_bots():
 
     while len(players) < MAX_PLAYERS:
 
-        name = BOT_NAMES[bot_number % len(BOT_NAMES)]
+        name = BOT_NAMES[
+            bot_number
+            % len(BOT_NAMES)
+        ]
 
-        bot_id = f"bot_{name.lower().replace(' ', '_')}"
+        bot_id = (
+            "bot_"
+            + name.lower()
+            .replace(" ", "_")
+        )
 
-        # Never overwrite a real user.
         if bot_id in players:
+
             bot_number += 1
+
             continue
 
         players[bot_id] = {
-            "user_id": bot_id,
-            "name": name,
-            "chips": STARTING_CHIPS,
-            "cards": [],
-            "folded": False,
-            "all_in": False,
-            "bet": 0,
-            "total_bet": 0,
-            "acted": False,
-            "is_bot": True,
+
+            "user_id":
+                bot_id,
+
+            "name":
+                name,
+
+            "chips":
+                STARTING_CHIPS,
+
+            "cards":
+                [],
+
+            "folded":
+                False,
+
+            "all_in":
+                False,
+
+            "bet":
+                0,
+
+            "total_bet":
+                0,
+
+            "acted":
+                False,
+
+            "is_bot":
+                True,
         }
 
         bot_number += 1
@@ -833,38 +1505,60 @@ def add_bots():
 def start_hand():
 
     if len(players) < 2:
+
         return False
 
-    # Keep exactly the players already registered.
-    # Do NOT replace or overwrite human players.
+    cancel_turn_timer()
 
     game["started"] = True
-    game["deck"] = create_deck()
-    random.shuffle(game["deck"])
 
-    game["community_cards"] = []
+    game["deck"] = create_deck()
+
+    random.shuffle(
+        game["deck"]
+    )
+
+    game[
+        "community_cards"
+    ] = []
+
     game["pot"] = 0
+
     game["stage"] = "preflop"
-    game["current_bet"] = BIG_BLIND
+
+    game[
+        "current_bet"
+    ] = BIG_BLIND
+
     game["winner"] = None
+
     game["message"] = ""
 
     ids = ordered_player_ids()
 
     if not ids:
+
         return False
 
-    if game["dealer_index"] >= len(ids):
+    if (
+        game["dealer_index"]
+        >= len(ids)
+    ):
+
         game["dealer_index"] = 0
 
-    # Reset players.
     for p in players.values():
 
         p["cards"] = []
+
         p["folded"] = False
+
         p["all_in"] = False
+
         p["bet"] = 0
+
         p["total_bet"] = 0
+
         p["acted"] = False
 
     # -----------------------------------------------------
@@ -872,14 +1566,20 @@ def start_hand():
     # -----------------------------------------------------
 
     for _ in range(2):
+
         for player_id in ids:
 
-            player = players[player_id]
+            player = players[
+                player_id
+            ]
 
             card = deal_card()
 
             if card:
-                player["cards"].append(card)
+
+                player[
+                    "cards"
+                ].append(card)
 
     # -----------------------------------------------------
     # BLINDS
@@ -889,26 +1589,73 @@ def start_hand():
 
     if n == 2:
 
-        dealer_id = ids[game["dealer_index"] % n]
+        dealer_id = ids[
+            game["dealer_index"]
+            % n
+        ]
 
         small_id = dealer_id
-        big_id = ids[(game["dealer_index"] + 1) % n]
 
-        post_blind(players[small_id], SMALL_BLIND)
-        post_blind(players[big_id], BIG_BLIND)
+        big_id = ids[
+            (
+                game["dealer_index"]
+                + 1
+            ) % n
+        ]
 
-        game["current_player"] = next_active_player(big_id)
+        post_blind(
+            players[small_id],
+            SMALL_BLIND
+        )
+
+        post_blind(
+            players[big_id],
+            BIG_BLIND
+        )
+
+        first = next_active_player(
+            big_id
+        )
 
     else:
 
-        small_id = ids[(game["dealer_index"] + 1) % n]
-        big_id = ids[(game["dealer_index"] + 2) % n]
+        small_id = ids[
+            (
+                game["dealer_index"]
+                + 1
+            ) % n
+        ]
 
-        post_blind(players[small_id], SMALL_BLIND)
-        post_blind(players[big_id], BIG_BLIND)
+        big_id = ids[
+            (
+                game["dealer_index"]
+                + 2
+            ) % n
+        ]
 
-        # Preflop starts after big blind.
-        game["current_player"] = next_active_player(big_id)
+        post_blind(
+            players[small_id],
+            SMALL_BLIND
+        )
+
+        post_blind(
+            players[big_id],
+            BIG_BLIND
+        )
+
+        first = next_active_player(
+            big_id
+        )
+
+    if not first:
+
+        game["started"] = False
+
+        return False
+
+    game[
+        "current_player"
+    ] = first
 
     return True
 
@@ -919,101 +1666,170 @@ def start_hand():
 
 def finish_hand():
 
+    cancel_turn_timer()
+
     alive = [
-        p for p in players.values()
+        p
+        for p in players.values()
         if not p["folded"]
     ]
 
     if not alive:
+
         game["started"] = False
+
+        game[
+            "current_player"
+        ] = None
+
         return
 
-    # One player left.
+    # -----------------------------------------------------
+    # ONE PLAYER LEFT
+    # -----------------------------------------------------
+
     if len(alive) == 1:
 
         winner = alive[0]
 
-        winner["chips"] += game["pot"]
+        winner["chips"] += (
+            game["pot"]
+        )
 
-        game["winner"] = winner["name"]
-        game["message"] = f"{winner['name']} wins {game['pot']} chips!"
+        game[
+            "winner"
+        ] = winner["name"]
+
+        game[
+            "message"
+        ] = (
+            f"{winner['name']} "
+            f"wins {game['pot']} chips!"
+        )
+
         game["pot"] = 0
+
         game["started"] = False
-        game["current_player"] = None
+
+        game[
+            "current_player"
+        ] = None
 
         return
 
-    # Showdown.
+    # -----------------------------------------------------
+    # SHOWDOWN
+    # -----------------------------------------------------
+
     scores = []
 
     for p in alive:
 
         score = evaluate_hand(
-            p["cards"] + game["community_cards"]
+            p["cards"]
+            + game["community_cards"]
         )
 
         scores.append(
-            (score, p)
+            (
+                score,
+                p
+            )
         )
 
-    best_score = max(score for score, p in scores)
+    best_score = max(
+        score
+        for score, p in scores
+    )
 
     winners = [
-        p for score, p in scores
+        p
+        for score, p in scores
         if score == best_score
     ]
 
     if not winners:
+
         return
 
-    share = game["pot"] // len(winners)
-    remainder = game["pot"] % len(winners)
+    share = (
+        game["pot"]
+        // len(winners)
+    )
 
-    for index, winner in enumerate(winners):
+    remainder = (
+        game["pot"]
+        % len(winners)
+    )
+
+    for index, winner in enumerate(
+        winners
+    ):
 
         amount = share
 
         if index == 0:
+
             amount += remainder
 
         winner["chips"] += amount
 
     if len(winners) == 1:
 
-        game["winner"] = winners[0]["name"]
+        game[
+            "winner"
+        ] = winners[0]["name"]
 
-        game["message"] = (
-            f"{winners[0]['name']} wins {game['pot']} chips!"
+        game[
+            "message"
+        ] = (
+            f"{winners[0]['name']} "
+            f"wins {game['pot']} chips!"
         )
 
     else:
 
         names = ", ".join(
-            p["name"] for p in winners
+            p["name"]
+            for p in winners
         )
 
-        game["winner"] = names
+        game[
+            "winner"
+        ] = names
 
-        game["message"] = (
-            f"Tie! {names} split {game['pot']} chips."
+        game[
+            "message"
+        ] = (
+            f"Tie! {names} "
+            f"split {game['pot']} chips."
         )
 
     game["pot"] = 0
+
     game["started"] = False
-    game["current_player"] = None
+
+    game[
+        "current_player"
+    ] = None
 
 
 # =========================================================
-# ROUTES
+# ROOT
 # =========================================================
 
 @app.get("/")
 def root():
 
     return {
-        "status": "online",
-        "message": "Poker backend is running",
-        "version": "6.0-fixed-turn"
+        "status":
+            "online",
+
+        "message":
+            "Poker backend is running",
+
+        "version":
+            "7.0-15-second-turns"
     }
 
 
@@ -1021,7 +1837,8 @@ def root():
 def health():
 
     return {
-        "status": "ok"
+        "status":
+            "ok"
     }
 
 
@@ -1030,55 +1847,111 @@ def health():
 # =========================================================
 
 @app.post("/join")
-def join(req: JoinRequest):
+def join(
+    req: JoinRequest
+):
 
-    user_id = str(req.user_id).strip()
+    user_id = str(
+        req.user_id
+    ).strip()
 
     if not user_id:
+
         return {
-            "success": False,
-            "message": "Invalid user ID"
+            "success":
+                False,
+
+            "message":
+                "Invalid user ID"
         }
 
-    # CRITICAL:
-    # Existing human user is NEVER replaced by a bot.
     if user_id in players:
 
-        if not players[user_id].get("is_bot", False):
-            players[user_id]["name"] = req.name or "Player"
+        if not players[
+            user_id
+        ].get("is_bot", False):
+
+            players[
+                user_id
+            ]["name"] = (
+                req.name
+                or "Player"
+            )
 
         return {
-            "success": True,
-            "message": "Already joined",
-            "user_id": user_id,
-            "name": players[user_id]["name"]
+            "success":
+                True,
+
+            "message":
+                "Already joined",
+
+            "user_id":
+                user_id,
+
+            "name":
+                players[
+                    user_id
+                ]["name"]
         }
 
     if len(players) >= MAX_PLAYERS:
 
         return {
-            "success": False,
-            "message": "Table is full"
+            "success":
+                False,
+
+            "message":
+                "Table is full"
         }
 
     players[user_id] = {
-        "user_id": user_id,
-        "name": req.name or "Player",
-        "chips": STARTING_CHIPS,
-        "cards": [],
-        "folded": False,
-        "all_in": False,
-        "bet": 0,
-        "total_bet": 0,
-        "acted": False,
-        "is_bot": False,
+
+        "user_id":
+            user_id,
+
+        "name":
+            req.name
+            or "Player",
+
+        "chips":
+            STARTING_CHIPS,
+
+        "cards":
+            [],
+
+        "folded":
+            False,
+
+        "all_in":
+            False,
+
+        "bet":
+            0,
+
+        "total_bet":
+            0,
+
+        "acted":
+            False,
+
+        "is_bot":
+            False,
     }
 
     return {
-        "success": True,
-        "message": "Joined",
-        "user_id": user_id,
-        "name": players[user_id]["name"]
+        "success":
+            True,
+
+        "message":
+            "Joined",
+
+        "user_id":
+            user_id,
+
+        "name":
+            players[
+                user_id
+            ]["name"]
     }
 
 
@@ -1093,32 +1966,73 @@ def get_players():
 
     ids = ordered_player_ids()
 
-    for index, p in enumerate(players.values()):
+    for p in players.values():
 
         result.append({
-            "user_id": p["user_id"],
-            "name": p["name"],
-            "chips": p["chips"],
-            "bet": p["bet"],
-            "folded": p["folded"],
-            "all_in": p["all_in"],
-            "is_turn": (
-                game["started"]
-                and game["current_player"] == p["user_id"]
-            ),
-            "dealer": (
-                len(ids) > 0
-                and ids[game["dealer_index"] % len(ids)]
-                == p["user_id"]
-            ),
-            "small_blind": False,
-            "big_blind": False,
-            "is_bot": p.get("is_bot", False),
+
+            "user_id":
+                p["user_id"],
+
+            "name":
+                p["name"],
+
+            "chips":
+                p["chips"],
+
+            "bet":
+                p["bet"],
+
+            "folded":
+                p["folded"],
+
+            "all_in":
+                p["all_in"],
+
+            "is_turn":
+                (
+                    game["started"]
+                    and
+                    game[
+                        "current_player"
+                    ]
+                    ==
+                    p["user_id"]
+                ),
+
+            "dealer":
+                (
+                    len(ids) > 0
+                    and
+                    ids[
+                        game[
+                            "dealer_index"
+                        ]
+                        % len(ids)
+                    ]
+                    ==
+                    p["user_id"]
+                ),
+
+            "small_blind":
+                False,
+
+            "big_blind":
+                False,
+
+            "is_bot":
+                p.get(
+                    "is_bot",
+                    False
+                ),
+
         })
 
     return {
-        "success": True,
-        "players": result
+        "success":
+            True,
+
+        "players":
+            result
     }
 
 
@@ -1132,12 +2046,13 @@ async def start():
     if game["started"]:
 
         return {
-            "success": False,
-            "message": "Game already started"
+            "success":
+                False,
+
+            "message":
+                "Game already started"
         }
 
-    # If only one human exists,
-    # automatically fill remaining seats with bots.
     if len(players) == 1:
 
         add_bots()
@@ -1145,8 +2060,11 @@ async def start():
     if len(players) < 2:
 
         return {
-            "success": False,
-            "message": "Need at least 2 players"
+            "success":
+                False,
+
+            "message":
+                "Need at least 2 players"
         }
 
     ok = start_hand()
@@ -1154,21 +2072,61 @@ async def start():
     if not ok:
 
         return {
-            "success": False,
-            "message": "Could not start game"
+            "success":
+                False,
+
+            "message":
+                "Could not start game"
         }
 
-    # Start bots only if the current player is a bot.
-    if (
+    # Start 15-second timer.
+    schedule_turn_timer(
         game["current_player"]
-        and players.get(game["current_player"], {}).get("is_bot")
-    ):
-
-        asyncio.create_task(run_bots())
+    )
 
     return {
-        "success": True,
-        "message": "Game started"
+        "success":
+            True,
+
+        "started":
+            True,
+
+        "stage":
+            game["stage"],
+
+        "community_cards":
+            game[
+                "community_cards"
+            ],
+
+        "pot":
+            game["pot"],
+
+        "current_player":
+            game[
+                "current_player"
+            ],
+
+        "current_player_name":
+            players[
+                game[
+                    "current_player"
+                ]
+            ]["name"],
+
+        "current_bet":
+            game[
+                "current_bet"
+            ],
+
+        "turn_time":
+            TURN_TIME,
+
+        "turn_remaining":
+            TURN_TIME,
+
+        "message":
+            "Game started"
     }
 
 
@@ -1181,24 +2139,84 @@ def get_game():
 
     current_name = None
 
-    if game["current_player"] in players:
+    if (
+        game[
+            "current_player"
+        ]
+        in players
+    ):
 
         current_name = players[
-            game["current_player"]
+            game[
+                "current_player"
+            ]
         ]["name"]
 
+    remaining = get_remaining_time()
+
     return {
-        "success": True,
-        "started": game["started"],
-        "stage": game["stage"],
-        "community_cards": game["community_cards"],
-        "pot": game["pot"],
-        "current_player": game["current_player"],
-        "current_player_name": current_name,
-        "current_bet": game["current_bet"],
-        "winner": game["winner"],
-        "message": game["message"],
-        "dealer_index": game["dealer_index"],
+
+        "success":
+            True,
+
+        "started":
+            game["started"],
+
+        "stage":
+            game["stage"],
+
+        "community_cards":
+            game[
+                "community_cards"
+            ],
+
+        "pot":
+            game["pot"],
+
+        "current_player":
+            game[
+                "current_player"
+            ],
+
+        "current_player_name":
+            current_name,
+
+        "current_bet":
+            game[
+                "current_bet"
+            ],
+
+        "winner":
+            game["winner"],
+
+        "message":
+            game["message"],
+
+        "dealer_index":
+            game["dealer_index"],
+
+        "turn_time":
+            TURN_TIME,
+
+        "turn_remaining":
+            remaining,
+
+        "turn_deadline":
+            (
+                int(
+                    time.time() * 1000
+                    + max(
+                        0,
+                        (
+                            turn_deadline
+                            - time.monotonic()
+                        )
+                    ) * 1000
+                )
+                if turn_deadline
+                and game["started"]
+                else None
+            )
     }
 
 
@@ -1207,25 +2225,44 @@ def get_game():
 # =========================================================
 
 @app.get("/my-cards")
-def my_cards(user_id: str):
+def my_cards(
+    user_id: str
+):
 
-    user_id = str(user_id).strip()
+    user_id = str(
+        user_id
+    ).strip()
 
-    player = players.get(user_id)
+    player = players.get(
+        user_id
+    )
 
     if not player:
 
         return {
-            "success": False,
-            "message": "Player not found",
-            "cards": []
+            "success":
+                False,
+
+            "message":
+                "Player not found",
+
+            "cards":
+                []
         }
 
     return {
-        "success": True,
-        "user_id": user_id,
-        "name": player["name"],
-        "cards": player["cards"]
+
+        "success":
+            True,
+
+        "user_id":
+            user_id,
+
+        "name":
+            player["name"],
+
+        "cards":
+            player["cards"]
     }
 
 
@@ -1234,23 +2271,35 @@ def my_cards(user_id: str):
 # =========================================================
 
 @app.post("/action")
-async def action(req: ActionRequest):
+async def action(
+    req: ActionRequest
+):
 
-    user_id = str(req.user_id).strip()
+    user_id = str(
+        req.user_id
+    ).strip()
 
-    # Never allow a human request to control a bot.
     if user_id not in players:
 
         return {
-            "success": False,
-            "message": "Player not found"
+            "success":
+                False,
+
+            "message":
+                "Player not found"
         }
 
-    if players[user_id].get("is_bot"):
+    # Humans only.
+    if players[
+        user_id
+    ].get("is_bot"):
 
         return {
-            "success": False,
-            "message": "Bots act automatically"
+            "success":
+                False,
+
+            "message":
+                "Bots act automatically"
         }
 
     result = process_action(
@@ -1259,19 +2308,8 @@ async def action(req: ActionRequest):
         req.amount or 0
     )
 
-    # If next player is bot, launch bot loop.
-    if (
-        result.get("success")
-        and game["started"]
-        and game["current_player"]
-        and players.get(
-            game["current_player"],
-            {}
-        ).get("is_bot")
-    ):
-
-        asyncio.create_task(run_bots())
-
+    # process_action already starts
+    # the timer for the next player.
     return result
 
 
@@ -1285,54 +2323,68 @@ async def new_hand():
     if game["started"]:
 
         return {
-            "success": False,
-            "message": "Current hand is still running"
+            "success":
+                False,
+
+            "message":
+                "Current hand is still running"
         }
 
-    # Dealer moves.
+    cancel_turn_timer()
+
     if players:
 
-        game["dealer_index"] = (
-            game["dealer_index"] + 1
+        game[
+            "dealer_index"
+        ] = (
+            game[
+                "dealer_index"
+            ] + 1
         ) % len(players)
 
-    # Remove busted players except bots can be refreshed.
-    for user_id in list(players.keys()):
+    for user_id in list(
+        players.keys()
+    ):
 
-        p = players[user_id]
+        p = players[
+            user_id
+        ]
 
         if p["chips"] <= 0:
 
-            if p.get("is_bot"):
-
-                p["chips"] = STARTING_CHIPS
-
-            else:
-
-                p["chips"] = STARTING_CHIPS
+            p["chips"] = (
+                STARTING_CHIPS
+            )
 
     ok = start_hand()
 
     if not ok:
 
         return {
-            "success": False,
-            "message": "Could not start new hand"
+            "success":
+                False,
+
+            "message":
+                "Could not start new hand"
         }
 
-    if (
+    schedule_turn_timer(
         game["current_player"]
-        and players.get(
-            game["current_player"],
-            {}
-        ).get("is_bot")
-    ):
-
-        asyncio.create_task(run_bots())
+    )
 
     return {
-        "success": True,
-        "message": "New hand started"
+
+        "success":
+            True,
+
+        "message":
+            "New hand started",
+
+        "turn_time":
+            TURN_TIME,
+
+        "turn_remaining":
+            TURN_TIME
     }
 
 
@@ -1343,21 +2395,47 @@ async def new_hand():
 @app.post("/reset")
 def reset():
 
+    cancel_turn_timer()
+
     players.clear()
 
     game["started"] = False
+
     game["deck"] = []
-    game["community_cards"] = []
+
+    game[
+        "community_cards"
+    ] = []
+
     game["pot"] = 0
+
     game["stage"] = "waiting"
-    game["current_player"] = None
-    game["current_bet"] = 0
-    game["dealer_index"] = 0
-    game["acted_players"] = []
+
+    game[
+        "current_player"
+    ] = None
+
+    game[
+        "current_bet"
+    ] = 0
+
+    game[
+        "dealer_index"
+    ] = 0
+
+    game[
+        "acted_players"
+    ] = []
+
     game["winner"] = None
+
     game["message"] = ""
 
     return {
-        "success": True,
-        "message": "Game reset"
+
+        "success":
+            True,
+
+        "message":
+            "Game reset"
     }
